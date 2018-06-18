@@ -205,7 +205,7 @@ upb_json_SRCS = \
 # 	$(Q) ragel -C -o upb/json/parser.c upb/json/parser.rl
 ragel:
 	$(E) RAGEL upb/json/parser.rl
-	$(Q) ragel -C -o upb/json/parser.c upb/json/parser.rl
+	$(Q) ragel -C -G0 -o upb/json/parser.c upb/json/parser.rl
 
 # If the user doesn't specify an -O setting, we use -O3 for critical-path
 # code and -Os for the rest.
