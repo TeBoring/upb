@@ -110,6 +110,7 @@ typedef struct {
   upb_json_parsermethod *method;
   upb_pb_encoder *encoder;
   upb_stringsink sink;
+  char *type_url;
 } upb_any_jsonparser_frame;
 
 typedef struct {
@@ -251,14 +252,6 @@ static bool check_stack(upb_json_parser *p) {
 static void set_name_table(upb_json_parser *p, upb_jsonparser_frame *frame) {
   upb_value v;
   bool ok = upb_inttable_lookupptr(&p->method->name_tables, frame->m, &v);
-  UPB_ASSERT(ok);
-  frame->name_table = upb_value_getptr(v);
-}
-
-static void set_any_name_table(upb_json_parser *p, upb_jsonparser_frame *frame) {
-  upb_value v;
-  bool ok = upb_inttable_lookupptr(
-      &p->top->any_jsonparser_frame->method->name_tables, frame->m, &v);
   UPB_ASSERT(ok);
   frame->name_table = upb_value_getptr(v);
 }
@@ -965,6 +958,36 @@ static bool start_stringval(upb_json_parser *p) {
   }
 }
 
+static void any_jsonparser_frame_set_type_url(
+  upb_any_jsonparser_frame *frame,
+  const char *type_url, int len) {
+  UPB_ASSERT(!frame->type_url);
+  frame->type_url = upb_gmalloc(len + 1);
+  strncpy(frame->type_url, type_url, len);
+  frame->type_url[len] = 0;
+}
+
+static void any_jsonparser_frame_new_serializer(
+    upb_json_parser *p) {
+  upb_any_jsonparser_frame *frame = p->top->any_jsonparser_frame;
+
+  frame->any_payload_serialize_handlers =
+      upb_pb_encoder_newhandlers(
+          p->top->m, &frame->any_payload_serialize_handlers);
+  upb_stringsink_init(&frame->sink);
+  frame->encoder = upb_pb_encoder_create(
+      p->env, frame->any_payload_serialize_handlers, &frame->sink.sink);
+
+  frame->method = p->method;
+  p->method = upb_json_parsermethod_new(p->top->m, frame);
+
+  upb_sink_reset(&p->top->sink, frame->any_payload_serialize_handlers,
+                 frame->encoder);
+  upb_sink_startmsg(&p->top->sink);
+
+  return frame;
+}
+
 static upb_any_jsonparser_frame *new_any_jsonparser_frame(
     upb_json_parser *p) {
   upb_any_jsonparser_frame *frame =
@@ -1022,9 +1045,14 @@ static bool end_stringval(upb_json_parser *p) {
         sel = getsel_for_handlertype(p, UPB_HANDLER_ENDSTR);
         upb_sink_endstr(&inner->sink, sel);
 
+        any_jsonparser_frame_set_type_url(
+            p->top->any_jsonparser_frame, buf, len);
+
         /*  When this frame becomes top again, the parsing is ready to finish. */
         p->top->parse_any_round = PARSE_ANY_FINISH;
         multipart_end(p);
+
+        return true;
 
         /* Prepare parser frame for value field. */
         upb_value v;
@@ -1311,6 +1339,7 @@ static void end_member(upb_json_parser *p) {
 static void start_any(upb_json_parser *p, const char *any_start) {
   p->top->any_start = any_start;
   p->top->parse_any_round = PARSE_ANY_ROUND1;
+  p->top->any_jsonparser_frame = upb_gmalloc(sizeof(upb_any_jsonparser_frame));
 }
 
 static const char* end_any_round1(upb_json_parser *p) {
@@ -1335,6 +1364,54 @@ static void end_any_round2(upb_json_parser *p) {
   upb_sink_putstring(&inner->sink, sel, buf, len, NULL);
   sel = getsel_for_handlertype(p, UPB_HANDLER_ENDSTR);
   upb_sink_endstr(&inner->sink, sel);
+}
+
+static int end_any_machine(upb_json_parser *p, 
+                           const char **buf,
+                           int *well_known_type) {
+  /* Prepare parser frame for value field. */
+  upb_value v;
+  bool ok = upb_strtable_lookup2(p->top->name_table, "value", 5, &v);
+  UPB_ASSERT(ok);
+  p->top->f = upb_value_getconstptr(v);
+
+  upb_jsonparser_frame *inner = p->top + 1;
+  upb_jsonparser_frame *outer = p->top;
+  inner->parse_any_round = PARSE_ANY_SWITCH;
+  *buf = p->top->any_start;
+  p->top->any_start = NULL;
+  inner->f = NULL;
+  inner->is_map = false;
+  inner->is_mapentry = false;
+  inner->any_start = p->top->any_start;
+  p->top->any_start = NULL;
+
+  p->top = inner;
+
+  const char *type_url = outer->any_jsonparser_frame->type_url;
+  int len = strlen(type_url);
+  if (len > 20 && strncmp(type_url, "type.googleapis.com/", 20) == 0) {
+    type_url += 20;
+    len -= 20;
+
+    if (upb_strtable_lookup2(&p->symbol_table->symtab, type_url, len, &v)) {
+      inner->m = upb_value_getptr(v);
+      inner->well_known_type = get_well_known_type(p);
+      *well_known_type = inner->well_known_type;
+
+      inner->any_jsonparser_frame = outer->any_jsonparser_frame;
+      any_jsonparser_frame_new_serializer(p);
+      set_name_table(p, p->top);
+
+      return true;
+    } else {
+      // TODO(teboring): Invalid type url.
+      return false;
+    }
+  } else {
+    // TODO(teboring): Invalid type url.
+    return false;
+  }
 }
 
 static int end_normal_machine(upb_json_parser *p) {
@@ -1396,14 +1473,15 @@ static int any_round1_finished(upb_json_parser *p) {
   return p->top->parse_any_round == PARSE_ANY_SWITCH;
 }
 
-static int end_any_member(upb_json_parser *p, const char **buf) {
-  if (p->top->parse_any_round == PARSE_ANY_SWITCH) {
-    *buf = p->top->any_start;
-    p->top->any_start = NULL;
-    return p->top->well_known_type;
-  } else {
-    return -1;
-  }
+static void end_any_member(upb_json_parser *p) {
+  p->top->f = NULL;
+  // if (p->top->parse_any_round == PARSE_ANY_SWITCH) {
+  //   *buf = p->top->any_start;
+  //   p->top->any_start = NULL;
+  //   return p->top->well_known_type;
+  // } else {
+  //   return -1;
+  // }
 }
 
 static bool start_subobject(upb_json_parser *p) {
@@ -1658,8 +1736,15 @@ static void end_object(upb_json_parser *p) {
       @{ CHECK_RETURN_TOP(end_any_membername(parser)); }
     ws ":" ws
     value2
+      %{ end_any_member(parser); }
+    ws;
+
+  any_machine :=
+    (any_member ("," any_member)*)?
       %{
-        switch (end_any_member(parser, &p)) {
+        int well_known_type;
+        CHECK_RETURN_TOP(end_any_machine(parser, &p, &well_known_type));
+        switch (well_known_type) {
         case WELL_KNOWN_ANY:
           fcall any_machine;
         case WELL_KNOWN_NORMAL:
@@ -1668,12 +1753,8 @@ static void end_object(upb_json_parser *p) {
           break;
         }
       }
-    ws;
-
-  any_machine :=
-    (any_member ("," any_member)*)?
-    any_machine_end : ( "}"
-      @{
+    any_machine_end: ("}"
+      >{
         end_any_round2(parser);
         fhold;
         fret;
