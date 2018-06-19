@@ -1661,7 +1661,7 @@ static void end_object(upb_json_parser *p) {
       %{
         switch (end_any_member(parser, &p)) {
         case WELL_KNOWN_ANY:
-          fcall any_machine;
+          fgoto well_known_type_machine;
         case WELL_KNOWN_NORMAL:
           fgoto normal_machine;
         default:
@@ -1751,6 +1751,33 @@ static void end_object(upb_json_parser *p) {
   value_machine :=
     value
     <: any >{ fhold; fret; } ;
+
+  type_url_member =
+    ws
+    '"@type"'
+    ws ":" ws
+    string
+      >{ multipart_startaccum(parser); }
+      @{ multipart_end(parser); }
+    ws;
+
+  value_member =
+    ws
+    '"value"'
+    ws ":" ws
+    object
+    ws;
+
+  well_known_member =
+    type_url_member
+    | value_member
+    ;
+
+  well_known_type_machine :=
+    (well_known_member ("," well_known_member)*)?
+    "}"
+      @{ fhold; fgoto any_machine_end; }
+    ;
 
   main := ws object ws;
 }%%
