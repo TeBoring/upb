@@ -7,6 +7,7 @@
 
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 
 struct upb_json_printer {
   upb_sink input_;
@@ -27,6 +28,12 @@ struct upb_json_printer {
    * repeated fields and messages (maps), and the worst case is a
    * message->repeated field->submessage->repeated field->... nesting. */
   bool first_elem_[UPB_MAX_HANDLER_DEPTH * 2];
+
+  /* To print timestamp, printer needs to cache its seconds and nanos values
+   * and convert them when ending timestamp message. See comments of
+   * printer_sethandlers_timestamp for more detail. */
+  int64_t seconds;
+  int32_t nanos;
 };
 
 /* StringPiece; a pointer plus a length. */
@@ -58,6 +65,15 @@ strpc *newstrpc(upb_handlers *h, const upb_fielddef *f,
     ret->len--;  /* NULL */
   }
 
+  upb_handlers_addcleanup(h, ret, freestrpc);
+  return ret;
+}
+
+/* Convert a null-terminated const char* to a string piece. */
+strpc *newstrpc_str(upb_handlers *h, const char * str) {
+  strpc * ret = upb_gmalloc(sizeof(*ret));
+  ret->ptr = upb_gstrdup(str);
+  ret->len = strlen(str);
   upb_handlers_addcleanup(h, ret, freestrpc);
   return ret;
 }
@@ -154,10 +170,23 @@ static void putstring(upb_json_printer *p, const char *buf, unsigned int len) {
  * Right now we use %.8g and %.17g for float/double, respectively, to match
  * proto2::util::JsonFormat's defaults.  May want to change this later. */
 
+const char neginf[] = "\"-Infinity\"";
+const char inf[] = "\"Infinity\"";
+
 static size_t fmt_double(double val, char* buf, size_t length) {
-  size_t n = _upb_snprintf(buf, length, "%.17g", val);
-  CHKLENGTH(n > 0 && n < length);
-  return n;
+  if (val == (1.0 / 0.0)) {
+    CHKLENGTH(length >= strlen(inf));
+    strcpy(buf, inf);
+    return strlen(inf);
+  } else if (val == (-1.0 / 0.0)) {
+    CHKLENGTH(length >= strlen(neginf));
+    strcpy(buf, neginf);
+    return strlen(neginf);
+  } else {
+    size_t n = _upb_snprintf(buf, length, "%.17g", val);
+    CHKLENGTH(n > 0 && n < length);
+    return n;
+  }
 }
 
 static size_t fmt_float(float val, char* buf, size_t length) {
@@ -672,6 +701,412 @@ void printer_sethandlers_mapentry(const void *closure, bool preserve_fieldnames,
   upb_handlerattr_uninit(&empty_attr);
 }
 
+static bool putseconds(void *closure, const void *handler_data,
+                       int64_t seconds) {
+  upb_json_printer *p = closure;
+  p->seconds = seconds;
+  UPB_UNUSED(handler_data);
+  return true;
+}
+
+static bool putnanos(void *closure, const void *handler_data,
+                     int32_t nanos) {
+  upb_json_printer *p = closure;
+  p->nanos = nanos;
+  UPB_UNUSED(handler_data);
+  return true;
+}
+
+static void *scalar_startstr_nokey(void *closure, const void *handler_data,
+                                   size_t size_hint) {
+  upb_json_printer *p = closure;
+  UPB_UNUSED(handler_data);
+  UPB_UNUSED(size_hint);
+  print_data(p, "\"", 1);
+  return p;
+}
+
+static size_t putstr_nokey(void *closure, const void *handler_data,
+                           const char *str, size_t len,
+                           const upb_bufhandle *handle) {
+  upb_json_printer *p = closure;
+  UPB_UNUSED(handler_data);
+  UPB_UNUSED(handle);
+  print_data(p, "\"", 1);
+  putstring(p, str, len);
+  print_data(p, "\"", 1);
+  return len + 2;
+}
+
+static void *startseq_nokey(void *closure, const void *handler_data) {
+  upb_json_printer *p = closure;
+  UPB_UNUSED(handler_data);
+  p->depth_++;
+  p->first_elem_[p->depth_] = true;
+  print_data(p, "[", 1);
+  return closure;
+}
+
+static void *startmap_nokey(void *closure, const void *handler_data) {
+  upb_json_printer *p = closure;
+  UPB_UNUSED(handler_data);
+  p->depth_++;
+  p->first_elem_[p->depth_] = true;
+  print_data(p, "{", 1);
+  return closure;
+}
+
+static bool putnull(void *closure, const void *handler_data,
+                    int32_t null) {
+  upb_json_printer *p = closure;
+  print_data(p, "null", 4);
+  UPB_UNUSED(handler_data);
+  UPB_UNUSED(null);
+  return true;
+}
+
+static bool printer_startdurationmsg(void *closure, const void *handler_data) {
+  upb_json_printer *p = closure;
+  UPB_UNUSED(handler_data);
+  if (p->depth_ == 0) {
+    upb_bytessink_start(p->output_, 0, &p->subc_);
+  }
+  return true;
+}
+
+#define UPB_DURATION_MAX_JSON_LEN 23
+#define UPB_DURATION_MAX_NANO_LEN 9
+
+static bool printer_enddurationmsg(void *closure, const void *handler_data,
+                                   upb_status *s) {
+  upb_json_printer *p = closure;
+  char buffer[UPB_DURATION_MAX_JSON_LEN];
+  size_t base_len;
+  size_t curr;
+  size_t i;
+
+  memset(buffer, 0, UPB_DURATION_MAX_JSON_LEN);
+
+  if (p->seconds < -315576000000) {
+    upb_status_seterrf(s, "error parsing duration: "
+                          "minimum acceptable value is "
+                          "-315576000000");
+    return false;
+  }
+
+  if (p->seconds > 315576000000) {
+    upb_status_seterrf(s, "error serializing duration: "
+                          "maximum acceptable value is "
+                          "315576000000");
+    return false;
+  }
+
+  _upb_snprintf(buffer, sizeof(buffer), "%ld", (long)p->seconds);
+  base_len = strlen(buffer);
+
+  if (p->nanos != 0) {
+    char nanos_buffer[UPB_DURATION_MAX_NANO_LEN + 3];
+    _upb_snprintf(nanos_buffer, sizeof(nanos_buffer), "%.9f",
+                  p->nanos / 1000000000.0);
+    /* Remove trailing 0. */
+    for (i = UPB_DURATION_MAX_NANO_LEN + 2;
+         nanos_buffer[i] == '0'; i--) {
+      nanos_buffer[i] = 0;
+    }
+    strcpy(buffer + base_len, nanos_buffer + 1);
+  }
+
+  curr = strlen(buffer);
+  strcpy(buffer + curr, "s");
+
+  p->seconds = 0;
+  p->nanos = 0;
+
+  print_data(p, "\"", 1);
+  print_data(p, buffer, strlen(buffer));
+  print_data(p, "\"", 1);
+
+  if (p->depth_ == 0) {
+    upb_bytessink_end(p->output_);
+  }
+
+  UPB_UNUSED(handler_data);
+  return true;
+}
+
+static bool printer_starttimestampmsg(void *closure, const void *handler_data) {
+  upb_json_printer *p = closure;
+  UPB_UNUSED(handler_data);
+  if (p->depth_ == 0) {
+    upb_bytessink_start(p->output_, 0, &p->subc_);
+  }
+  return true;
+}
+
+#define UPB_TIMESTAMP_MAX_JSON_LEN 31
+#define UPB_TIMESTAMP_BEFORE_NANO_LEN 19
+#define UPB_TIMESTAMP_MAX_NANO_LEN 9
+
+static bool printer_endtimestampmsg(void *closure, const void *handler_data,
+                                    upb_status *s) {
+  upb_json_printer *p = closure;
+  char buffer[UPB_TIMESTAMP_MAX_JSON_LEN];
+  time_t time = p->seconds;
+  size_t curr;
+  size_t i;
+  size_t year_length =
+      strftime(buffer, UPB_TIMESTAMP_MAX_JSON_LEN, "%Y", gmtime(&time));
+
+  if (p->seconds < -62135596800) {
+    upb_status_seterrf(s, "error parsing timestamp: "
+                          "minimum acceptable value is "
+                          "0001-01-01T00:00:00Z");
+    return false;
+  }
+
+  if (p->seconds > 253402300799) {
+    upb_status_seterrf(s, "error parsing timestamp: "
+                          "maximum acceptable value is "
+                          "9999-12-31T23:59:59Z");
+    return false;
+  }
+
+  /* strftime doesn't guarantee 4 digits for year. Prepend 0 by ourselves. */
+  for (i = 0; i < 4 - year_length; i++) {
+    buffer[i] = '0';
+  }
+
+  strftime(buffer + (4 - year_length), UPB_TIMESTAMP_MAX_JSON_LEN,
+           "%Y-%m-%dT%H:%M:%S", gmtime(&time));
+  if (p->nanos != 0) {
+    char nanos_buffer[UPB_TIMESTAMP_MAX_NANO_LEN + 3];
+    _upb_snprintf(nanos_buffer, sizeof(nanos_buffer), "%.9f",
+                  p->nanos / 1000000000.0);
+    /* Remove trailing 0. */
+    for (i = UPB_TIMESTAMP_MAX_NANO_LEN + 2;
+         nanos_buffer[i] == '0'; i--) {
+      nanos_buffer[i] = 0;
+    }
+    strcpy(buffer + UPB_TIMESTAMP_BEFORE_NANO_LEN, nanos_buffer + 1);
+  }
+
+  curr = strlen(buffer);
+  strcpy(buffer + curr, "Z");
+
+  p->seconds = 0;
+  p->nanos = 0;
+
+  print_data(p, "\"", 1);
+  print_data(p, buffer, strlen(buffer));
+  print_data(p, "\"", 1);
+
+  if (p->depth_ == 0) {
+    upb_bytessink_end(p->output_);
+  }
+
+  UPB_UNUSED(handler_data);
+  UPB_UNUSED(s);
+  return true;
+}
+
+static bool printer_startmsg_noframe(void *closure, const void *handler_data) {
+  upb_json_printer *p = closure;
+  UPB_UNUSED(handler_data);
+  if (p->depth_ == 0) {
+    upb_bytessink_start(p->output_, 0, &p->subc_);
+  }
+  return true;
+}
+
+static bool printer_endmsg_noframe(
+    void *closure, const void *handler_data, upb_status *s) {
+  upb_json_printer *p = closure;
+  UPB_UNUSED(handler_data);
+  UPB_UNUSED(s);
+  if (p->depth_ == 0) {
+    upb_bytessink_end(p->output_);
+  }
+  return true;
+}
+
+static void *scalar_startstr_onlykey(
+    void *closure, const void *handler_data, size_t size_hint) {
+  upb_json_printer *p = closure;
+  UPB_UNUSED(size_hint);
+  CHK(putkey(closure, handler_data));
+  return p;
+}
+
+/* Set up handlers for an Any submessage. */
+void printer_sethandlers_any(const void *closure, upb_handlers *h) {
+  const upb_msgdef *md = upb_handlers_msgdef(h);
+
+  const upb_fielddef* type_field = upb_msgdef_itof(md, UPB_ANY_TYPE);
+  const upb_fielddef* value_field = upb_msgdef_itof(md, UPB_ANY_VALUE);
+
+  upb_handlerattr empty_attr = UPB_HANDLERATTR_INITIALIZER;
+
+  /* type_url's json name is "@type" */
+  upb_handlerattr type_name_attr = UPB_HANDLERATTR_INITIALIZER;
+  upb_handlerattr value_name_attr = UPB_HANDLERATTR_INITIALIZER;
+  strpc *type_url_json_name = newstrpc_str(h, "@type");
+  strpc *value_json_name = newstrpc_str(h, "value");
+
+  upb_handlerattr_sethandlerdata(&type_name_attr, type_url_json_name);
+  upb_handlerattr_sethandlerdata(&value_name_attr, value_json_name);
+
+  /* Set up handlers. */
+  upb_handlers_setstartmsg(h, printer_startmsg, &empty_attr);
+  upb_handlers_setendmsg(h, printer_endmsg, &empty_attr);
+
+  upb_handlers_setstartstr(h, type_field, scalar_startstr, &type_name_attr);
+  upb_handlers_setstring(h, type_field, scalar_str, &empty_attr);
+  upb_handlers_setendstr(h, type_field, scalar_endstr, &empty_attr);
+
+  /* This is not the full and correct JSON encoding for the Any value field. It
+   * requires further processing by the wrapper code based on the type URL.
+   */
+  upb_handlers_setstartstr(h, value_field, scalar_startstr_onlykey,
+                           &value_name_attr);
+
+  UPB_UNUSED(closure);
+}
+
+/* Set up handlers for a duration submessage. */
+void printer_sethandlers_duration(const void *closure, upb_handlers *h) {
+  const upb_msgdef *md = upb_handlers_msgdef(h);
+
+  const upb_fielddef* seconds_field =
+      upb_msgdef_itof(md, UPB_DURATION_SECONDS);
+  const upb_fielddef* nanos_field =
+      upb_msgdef_itof(md, UPB_DURATION_NANOS);
+
+  upb_handlerattr empty_attr = UPB_HANDLERATTR_INITIALIZER;
+
+  upb_handlers_setstartmsg(h, printer_startdurationmsg, &empty_attr);
+  upb_handlers_setint64(h, seconds_field, putseconds, &empty_attr);
+  upb_handlers_setint32(h, nanos_field, putnanos, &empty_attr);
+  upb_handlers_setendmsg(h, printer_enddurationmsg, &empty_attr);
+
+  UPB_UNUSED(closure);
+}
+
+/* Set up handlers for a timestamp submessage. Instead of printing fields
+ * separately, the json representation of timestamp follows RFC 3339 */
+void printer_sethandlers_timestamp(const void *closure, upb_handlers *h) {
+  const upb_msgdef *md = upb_handlers_msgdef(h);
+
+  const upb_fielddef* seconds_field =
+      upb_msgdef_itof(md, UPB_TIMESTAMP_SECONDS);
+  const upb_fielddef* nanos_field =
+      upb_msgdef_itof(md, UPB_TIMESTAMP_NANOS);
+
+  upb_handlerattr empty_attr = UPB_HANDLERATTR_INITIALIZER;
+
+  upb_handlers_setstartmsg(h, printer_starttimestampmsg, &empty_attr);
+  upb_handlers_setint64(h, seconds_field, putseconds, &empty_attr);
+  upb_handlers_setint32(h, nanos_field, putnanos, &empty_attr);
+  upb_handlers_setendmsg(h, printer_endtimestampmsg, &empty_attr);
+
+  UPB_UNUSED(closure);
+}
+
+void printer_sethandlers_value(const void *closure, upb_handlers *h) {
+  const upb_msgdef *md = upb_handlers_msgdef(h);
+  upb_msg_field_iter i;
+
+  upb_handlerattr empty_attr = UPB_HANDLERATTR_INITIALIZER;
+
+  upb_handlers_setstartmsg(h, printer_startmsg_noframe, &empty_attr);
+  upb_handlers_setendmsg(h, printer_endmsg_noframe, &empty_attr);
+
+  upb_msg_field_begin(&i, md);
+  for(; !upb_msg_field_done(&i); upb_msg_field_next(&i)) {
+    const upb_fielddef *f = upb_msg_iter_field(&i);
+
+    switch (upb_fielddef_type(f)) {
+      case UPB_TYPE_ENUM:
+        upb_handlers_setint32(h, f, putnull, &empty_attr);
+        break;
+      case UPB_TYPE_DOUBLE:
+        upb_handlers_setdouble(h, f, putdouble, &empty_attr);
+        break;
+      case UPB_TYPE_STRING:
+        upb_handlers_setstartstr(h, f, scalar_startstr_nokey, &empty_attr);
+        upb_handlers_setstring(h, f, scalar_str, &empty_attr);
+        upb_handlers_setendstr(h, f, scalar_endstr, &empty_attr);
+        break;
+      case UPB_TYPE_BOOL:
+        upb_handlers_setbool(h, f, putbool, &empty_attr);
+        break;
+      case UPB_TYPE_MESSAGE:
+        break;
+      default:
+        UPB_ASSERT(false);
+        break;
+    }
+  }
+
+  UPB_UNUSED(closure);
+}
+
+#define WRAPPER_SETHANDLERS(wrapper, type, putmethod)                      \
+void printer_sethandlers_##wrapper(const void *closure, upb_handlers *h) { \
+  const upb_msgdef *md = upb_handlers_msgdef(h);                           \
+  const upb_fielddef* f = upb_msgdef_itof(md, 1);                          \
+  upb_handlerattr empty_attr = UPB_HANDLERATTR_INITIALIZER;                \
+  upb_handlers_setstartmsg(h, printer_startmsg_noframe, &empty_attr);      \
+  upb_handlers_setendmsg(h, printer_endmsg_noframe, &empty_attr);          \
+  upb_handlers_set##type(h, f, putmethod, &empty_attr);                    \
+  UPB_UNUSED(closure);                                                     \
+}
+
+WRAPPER_SETHANDLERS(doublevalue, double, putdouble)
+WRAPPER_SETHANDLERS(floatvalue,  float,  putfloat)
+WRAPPER_SETHANDLERS(int64value,  int64,  putint64_t)
+WRAPPER_SETHANDLERS(uint64value, uint64, putuint64_t)
+WRAPPER_SETHANDLERS(int32value,  int32,  putint32_t)
+WRAPPER_SETHANDLERS(uint32value, uint32, putuint32_t)
+WRAPPER_SETHANDLERS(boolvalue,   bool,   putbool)
+WRAPPER_SETHANDLERS(stringvalue, string, putstr_nokey)
+WRAPPER_SETHANDLERS(bytesvalue,  string, putbytes)
+
+#undef WRAPPER_SETHANDLERS
+
+void printer_sethandlers_listvalue(const void *closure, upb_handlers *h) {
+  const upb_msgdef *md = upb_handlers_msgdef(h);
+  const upb_fielddef* f = upb_msgdef_itof(md, 1);
+
+  upb_handlerattr empty_attr = UPB_HANDLERATTR_INITIALIZER;
+
+  upb_handlers_setstartseq(h, f, startseq_nokey, &empty_attr);
+  upb_handlers_setendseq(h, f, endseq, &empty_attr);
+
+  upb_handlers_setstartmsg(h, printer_startmsg_noframe, &empty_attr);
+  upb_handlers_setendmsg(h, printer_endmsg_noframe, &empty_attr);
+
+  upb_handlers_setstartsubmsg(h, f, repeated_startsubmsg, &empty_attr);
+
+  UPB_UNUSED(closure);
+}
+
+void printer_sethandlers_structvalue(const void *closure, upb_handlers *h) {
+  const upb_msgdef *md = upb_handlers_msgdef(h);
+  const upb_fielddef* f = upb_msgdef_itof(md, 1);
+
+  upb_handlerattr empty_attr = UPB_HANDLERATTR_INITIALIZER;
+
+  upb_handlers_setstartseq(h, f, startmap_nokey, &empty_attr);
+  upb_handlers_setendseq(h, f, endmap, &empty_attr);
+
+  upb_handlers_setstartmsg(h, printer_startmsg_noframe, &empty_attr);
+  upb_handlers_setendmsg(h, printer_endmsg_noframe, &empty_attr);
+
+  upb_handlers_setstartsubmsg(h, f, repeated_startsubmsg, &empty_attr);
+
+  UPB_UNUSED(closure);
+}
+
 void printer_sethandlers(const void *closure, upb_handlers *h) {
   const upb_msgdef *md = upb_handlers_msgdef(h);
   bool is_mapentry = upb_msgdef_mapentry(md);
@@ -685,6 +1120,45 @@ void printer_sethandlers(const void *closure, upb_handlers *h) {
      * separately. */
     printer_sethandlers_mapentry(closure, preserve_fieldnames, h);
     return;
+  }
+
+  switch (upb_msgdef_wellknowntype(md)) {
+    case UPB_WELLKNOWN_UNSPECIFIED:
+      break;
+    case UPB_WELLKNOWN_ANY:
+      printer_sethandlers_any(closure, h);
+      return;
+    case UPB_WELLKNOWN_DURATION:
+      printer_sethandlers_duration(closure, h);
+      return;
+    case UPB_WELLKNOWN_TIMESTAMP:
+      printer_sethandlers_timestamp(closure, h);
+      return;
+    case UPB_WELLKNOWN_VALUE:
+      printer_sethandlers_value(closure, h);
+      return;
+    case UPB_WELLKNOWN_LISTVALUE:
+      printer_sethandlers_listvalue(closure, h);
+      return;
+    case UPB_WELLKNOWN_STRUCT:
+      printer_sethandlers_structvalue(closure, h);
+      return;
+#define WRAPPER(wellknowntype, name)        \
+  case wellknowntype:                       \
+    printer_sethandlers_##name(closure, h); \
+    return;                                 \
+
+    WRAPPER(UPB_WELLKNOWN_DOUBLEVALUE, doublevalue);
+    WRAPPER(UPB_WELLKNOWN_FLOATVALUE, floatvalue);
+    WRAPPER(UPB_WELLKNOWN_INT64VALUE, int64value);
+    WRAPPER(UPB_WELLKNOWN_UINT64VALUE, uint64value);
+    WRAPPER(UPB_WELLKNOWN_INT32VALUE, int32value);
+    WRAPPER(UPB_WELLKNOWN_UINT32VALUE, uint32value);
+    WRAPPER(UPB_WELLKNOWN_BOOLVALUE, boolvalue);
+    WRAPPER(UPB_WELLKNOWN_STRINGVALUE, stringvalue);
+    WRAPPER(UPB_WELLKNOWN_BYTESVALUE, bytesvalue);
+
+#undef WRAPPER
   }
 
   upb_handlers_setstartmsg(h, printer_startmsg, &empty_attr);
@@ -794,6 +1268,8 @@ upb_json_printer *upb_json_printer_create(upb_env *e, const upb_handlers *h,
   p->output_ = output;
   json_printer_reset(p);
   upb_sink_reset(&p->input_, h, p);
+  p->seconds = 0;
+  p->nanos = 0;
 
   /* If this fails, increase the value in printer.h. */
   UPB_ASSERT_DEBUGVAR(upb_env_bytesallocated(e) - size_before <=
